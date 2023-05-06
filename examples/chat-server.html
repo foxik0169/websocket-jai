@@ -1,0 +1,43 @@
+
+<div id="chat_root">
+
+</div>
+
+<input id="name" placeholder="Vaše meno">
+<br>
+<textarea style="width: 100%; margin-top: 1rem;" rows=10 id="message" placeholder="Napíšte správu a stlačte enter..."></textarea>
+
+<script>
+    const message_element = document.getElementById("message");
+    const name_element = document.getElementById("name");
+    const root_element = document.getElementById("chat_root");
+
+    const socket = new WebSocket("ws://localhost:9000");
+
+    socket.addEventListener("open", (event) => {
+        console.log("socket opened...");
+    });
+
+    socket.addEventListener("message", (event) => {
+        const segments = event.data.split(":");
+        if (segments[0] == "MSGF") {
+            const new_element = document.createElement("div");
+            const content = document.createTextNode([segments[1], ": ", segments[2]].join(""));
+            new_element.appendChild(content);
+            root_element.appendChild(new_element);
+        }
+    });
+
+    name_element.addEventListener("change", e => {
+        socket.send(["NAME:", e.target.value].join(""));
+    });
+
+    message_element.addEventListener("keypress", e => {
+        if (e.key == "Enter") {
+            e.preventDefault();
+            socket.send(["MESG:", message_element.value].join(""));
+            message_element.value = "";
+        }
+    });
+</script>
+
