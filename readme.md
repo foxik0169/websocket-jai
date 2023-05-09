@@ -1,9 +1,16 @@
 # websocket-jai
 
-Rough implementation of websocket specification in JAI. Currently only Linux is supported as epoll is used for I/O.
-The module currently handles message loop internally and doesn't leave much control about it to the user.
+Rough implementation of websocket specification in JAI. Supports TLS. Currently only Linux is supported as epoll is 
+used for I/O. The module currently handles message loop internally and doesn't leave much control about it to the user.
 
 There are missing parts and in some cases the server could be wrong and/or crash. Use at own risk.
+
+## SSL
+
+For SSL to work you have to provide cert and key file that is trusted. Examples are currently setup to work for non-SSL
+connections so the .html files are loading 'ws://' url, which you will have to also change if you want to try it.
+
+Untrusted connections will be dropped.
 
 ## Problem with epoll bindings
 
@@ -17,7 +24,6 @@ epoll_event :: struct {
 ```
 
 ## Todo
- - TLS via OpenSSL
  - Support control frames (ping/pong,...)
  - Handle edgecases like when client hardcloses TCP connection
 
@@ -28,6 +34,5 @@ to multiple clients. Just start the server and open the html in browser.
 
 ## OpenSSL bindings
 
-The module also comes with generated OpenSSL bindings. There are some manual changes to the files. This also will
-probably change in the future.
+The module also comes with hand-written OpenSSL bindings. This also will probably change in the future.
 

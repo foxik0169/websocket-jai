@@ -7,18 +7,18 @@
 #import "Flat_Pool";
 #import "POSIX";
 
+Address_V4 :: struct {
+    ip:   [4]u8;
+    port: u16;
+}
+
 bind_ipv4 :: (s: Socket, ip: [4]u8, port: u16) -> s32 {
     address: sockaddr_in;
     address.sin_family = AF_INET;
-    address.sin_port = htons(port);
+    address.sin_port = byte_swap(port);
 
-    _ip := (ip[3] << 24) & (ip[2] << 16) & (ip[1] << 8) & ip[0];
-
-    #if OS == .WINDOWS {
-        address.sin_addr.S_un.S_addr = _ip;
-    } else {
-        address.sin_addr.s_addr = _ip;
-    }
+    #if OS == .WINDOWS address.sin_addr.S_un.S_addr = << cast(*u32)ip.data;
+    else address.sin_addr.s_addr = << cast(*u32)ip.data;
 
     return bind(s, xx *address, xx size_of(sockaddr_in));
 }
@@ -146,7 +146,7 @@ peek :: (buffer: *Queue_Buffer, count: u64 = 512) -> []u8 {
     output.data = buffer.blocks.memory.data + buffer.read_pos;
     output.count = xx output_count;
 
-    return output; //array_view(buffer.blocks.memory, xx buffer.read_pos, xx output_count);
+    return output;
 }
 
 have_read :: (buffer: *Queue_Buffer, count: u64) {
@@ -227,6 +227,8 @@ Client :: struct ($Data_Type: Type) {
     continuation_initial: Frame;
     continuation_payload: [..][]u8;
 
+    ssl_instance: *SSL;
+
     // user data...
     data: Data_Type;
 }
@@ -237,7 +239,21 @@ Websocket_Server :: struct ($Client_Data_Type: Type) {
     clients: [..]Client_Type;
     epoll_fd: s32;
 
-    on_message_callback: #type (*Websocket_Server(Client_Data_Type), *Client(Client_Data_Type), message: []u8);
+    ssl_context: *SSL_CTX;
+}
+
+Websocket_Config :: struct ($Client_Data_Type: Type) {
+    address: Address_V4 = .{.[127,0,0,1], 9000};
+
+    key_file:   string;
+    cert_file:  string;
+
+    on_connect_callback:    #type (*Websocket_Server(Client_Data_Type), *Client(Client_Data_Type));
+    on_message_callback:    #type (*Websocket_Server(Client_Data_Type), *Client(Client_Data_Type), message: []u8);
+    on_disconnect_callback: #type (*Websocket_Server(Client_Data_Type), *Client(Client_Data_Type));
+
+    use_ssl  := false;
+    init_ssl := true;  /* when set to false, user is required to initialize OpenSSL */
 }
 
 find_free_slot_or_add_client :: (clients: *[..]Client($Data_Type), client: Client(Data_Type)) -> *Client(Data_Type), s64 {
@@ -303,7 +319,7 @@ send :: (using server: *Websocket_Server($Client_Data_Type), client: *Client(Cli
     append(*client.output_buffer, net_message);
 
     epoll_ctl(epoll_fd, EPOLL_CTL_MOD, client.socket_fd, *epoll_event.{
-        events = xx EPOLLIN | xx EPOLLOUT | xx EPOLLET,
+        events = EPOLLIN | EPOLLOUT | EPOLLET,
         data = .{ ptr = client }
     });
 }
@@ -357,17 +373,65 @@ send_all :: (using server: *Websocket_Server($Client_Data_Type), message: []u8) 
         send(server, it, message);
 }
 
-start_server :: (using server: *Websocket_Server($Data_Type)) {
+ws_read :: (using client: *Client($Data), buffer: []u8, limit := -1) -> s64 {
+    read_count := buffer.count;
+    if limit != -1
+        read_count = min(buffer.count, limit);
+
+    if client.ssl_instance {
+        ret_val := SSL_read(client.ssl_instance, buffer.data, xx read_count);
+        err     := SSL_get_error(client.ssl_instance, ret_val);
+        return xx ret_val;
+    } else {
+        return recv(client.socket_fd, buffer.data, xx read_count, 0);
+    }
+}
+
+ws_write :: (client: *Client($Data), buffer: []u8, limit := -1) -> s64 {
+    write_count := buffer.count;
+    if limit != -1
+        write_count = min(buffer.count, limit);
+
+    if client.ssl_instance {
+        ret_val := SSL_write(client.ssl_instance, buffer.data, xx write_count);
+        err     := SSL_get_error(client.ssl_instance, ret_val);
+        return xx ret_val;
+    } else {
+        return send(client.socket_fd, buffer.data, xx write_count, 0);
+    }
+}
+
+start_server :: (using server: *Websocket_Server($Data_Type), config := Websocket_Config(Data_Type).{}) {
     log("Starting websocket server...");
+
+    if config.use_ssl {
+        if config.init_ssl {
+            OPENSSL_init_crypto(0, null);
+            OPENSSL_init_ssl(0, null);
+
+            SSL_load_error_strings();
+            OpenSSL_add_all_algorithms();
+        }
+
+        ssl_context = SSL_CTX_new(TLS_server_method());
+        if SSL_CTX_set_options(ssl_context, SSL_OP_NO_SSLv3) < 0
+            log("Could not set context options.");
+
+        PREFERRED_CIPHERS :: "HIGH:!aNULL:!kRSA:!PSK:!SRP:!MD5:!RC4\0";
+        SSL_CTX_set_cipher_list(ssl_context, PREFERRED_CIPHERS.data);
+
+        SSL_CTX_use_certificate_file(ssl_context, to_c_string(config.cert_file), SSL_FILETYPE_PEM);
+        SSL_CTX_use_PrivateKey_file(ssl_context, to_c_string(config.key_file), SSL_FILETYPE_PEM);
+    }
 
     socket_init();
     listen_socket = socket(AF_INET, .SOCK_STREAM, .TCP);
 
     socket_setting: u32 = 1;
-    setsockopt(
-        listen_socket, SOL_SOCKET, SO_REUSEADDR, *socket_setting, size_of(u32));
+    setsockopt(listen_socket, SOL_SOCKET, SO_REUSEADDR, *socket_setting, size_of(u32));
 
-    bind_ipv4(listen_socket, .[127, 0, 0, 1], 9000);
+    bind_ipv4(listen_socket, config.address.ip, config.address.port);
+    log("Websocket server listening on %\n", config.address);
 
     set_blocking(listen_socket, false);
     listen(listen_socket, 32);
@@ -380,7 +444,30 @@ start_server :: (using server: *Websocket_Server($Data_Type)) {
 
     defer close(epoll_fd);
 
-    epoll_ctl(epoll_fd, EPOLL_CTL_ADD, listen_socket, *epoll_event.{ events = xx EPOLLIN | xx EPOLLET, data = epoll_data.{ ptr = xx *listen_socket } });
+    epoll_ctl(epoll_fd, EPOLL_CTL_ADD, listen_socket, *epoll_event.{ events = EPOLLIN | EPOLLET, data = epoll_data.{ ptr = xx *listen_socket } });
+
+    write_out_client_buffer :: (using server: *Websocket_Server($Data), client: *Client(Data)) {
+        while true {
+            write_data := peek(*client.output_buffer, 512);
+            if write_data.count <= 0 break;
+
+            written := ws_write(client, write_data);
+            if written < 0 &&
+                (get_last_socket_error() == SOCKET_WOULDBLOCK || get_last_socket_error() == EAGAIN)
+            {
+                break;
+            }
+
+            have_read(*client.output_buffer, xx written);
+        }
+
+        if count(*client.output_buffer) <= 0 {
+            epoll_ctl(epoll_fd, EPOLL_CTL_MOD, client.socket_fd, *epoll_event.{
+                events = EPOLLIN | EPOLLET,
+                data = .{ ptr = client }
+            });
+        }
+    }
 
     while true {
         reset_temporary_storage();
@@ -397,34 +484,12 @@ start_server :: (using server: *Websocket_Server($Data_Type)) {
         for 0..event_count-1 {
             event := *events[it];
 
-            if event.events & xx EPOLLOUT == xx EPOLLOUT {
+            if event.events & EPOLLOUT == EPOLLOUT {
                 client := cast(*Client_Type)event.data.ptr;
-
-                while true {
-                    write_data := peek(*client.output_buffer, 512);
-                    if write_data.count <= 0 break;
-
-                    written := send(client.socket_fd, write_data.data, xx write_data.count, 0);
-                    if written == -1 &&
-                        (get_last_socket_error() == SOCKET_WOULDBLOCK || get_last_socket_error() == EAGAIN)
-                    {
-                        break;
-                    }
-
-                    have_read(*client.output_buffer, xx written);
-                }
-
-                if client.output_buffer.blocks == null ||
-                    (client.output_buffer.blocks.next == null && client.output_buffer.write_pos == 0)
-                {
-                    epoll_ctl(epoll_fd, EPOLL_CTL_MOD, client.socket_fd, *epoll_event.{
-                        events = xx EPOLLIN | xx EPOLLET,
-                        data = .{ ptr = client }
-                    });
-                }
+                write_out_client_buffer(server, client);
             }
 
-            if event.events & xx EPOLLIN == xx EPOLLIN {
+            if event.events & EPOLLIN == EPOLLIN {
                 if event.data.ptr == *listen_socket {
                     while true {
                         client := Client_Type.{
@@ -436,11 +501,28 @@ start_server :: (using server: *Websocket_Server($Data_Type)) {
                            client.socket_fd == -1 && get_last_socket_error() == EAGAIN /* posix */
                             break;
 
+                        if ssl_context {
+                            client.ssl_instance = SSL_new(ssl_context);
+                            SSL_set_fd(client.ssl_instance, client.socket_fd);
+                            SSL_accept(client.ssl_instance);
+
+                            err := ERR_get_error();
+                            if err != 0 {
+                                buff: [1024]u8;
+                                ERR_error_string(err, buff.data);
+                                log("error: %, %\n", err, to_string(buff.data));
+
+                                close(client.socket_fd);
+                                client.socket_fd = -1;
+                                continue;
+                            }
+                        }
+
                         set_blocking(client.socket_fd, false);
 
                         client_ptr := find_free_slot_or_add_client(*clients, client);
                         epoll_ctl(epoll_fd, EPOLL_CTL_ADD, client.socket_fd, *epoll_event.{
-                            events = xx EPOLLIN | xx EPOLLET,
+                            events = EPOLLIN | EPOLLET,
                             data = .{ ptr = client_ptr }
                         });
                     }
@@ -455,7 +537,7 @@ start_server :: (using server: *Websocket_Server($Data_Type)) {
                                 buffer: [1024]u8; // @todo Use global setting for input buffer size.
 
                                 while true {
-                                    in_count := recv(client.socket_fd, buffer.data, xx buffer.count, 0);
+                                    in_count := ws_read(client, buffer);
 
                                     if in_count == -1 {
                                         if get_last_socket_error() == SOCKET_WOULDBLOCK || get_last_socket_error() == EAGAIN
@@ -525,11 +607,15 @@ END;
                                     append(*client.output_buffer, cast([]u8)response);
 
                                     epoll_ctl(epoll_fd, EPOLL_CTL_MOD, client.socket_fd, *epoll_event.{
-                                        events = xx EPOLLIN | xx EPOLLOUT | xx EPOLLET,
+                                        events = EPOLLIN | EPOLLOUT | EPOLLET,
                                         data = .{ ptr = client }
                                     });
 
                                     log("Client connected, index: %...\n", client - clients.data);
+
+                                    if config.on_connect_callback
+                                        config.on_connect_callback(server, client);
+
                                     reset(*client.input_buffer);
 
                                     client.state = .ExpectAndReadFrameHeader;
@@ -540,13 +626,13 @@ END;
 
                                 if buffer_count < 6 {
                                     buffer: [6]u8;
-                                    in_count := recv(client.socket_fd, buffer.data, cast(u64) (6 - buffer_count), 0);
+                                    in_count := ws_read(client, buffer, xx (6 - buffer_count));
 
                                     if in_count == -1 {
                                         if get_last_socket_error() == SOCKET_WOULDBLOCK || get_last_socket_error() == EAGAIN
                                             continue;
 
-                                        log_error("Error: recv returned -1 with error %\n", get_last_socket_error());
+                                        log_error("Error: ws_read returned -1 with error %\n", get_last_socket_error());
                                         continue;
                                     } else if in_count == 0 {
                                         should_continue = true;
@@ -570,13 +656,13 @@ END;
 
                                     if expected_length != xx buffer_count {
                                         buffer: [8]u8;
-                                        in_count := recv(client.socket_fd, buffer.data, cast(u64) expected_length - buffer_count, 0);
+                                        in_count := ws_read(client, buffer, expected_length - xx buffer_count);
 
                                         if in_count == -1 {
                                             if get_last_socket_error() == SOCKET_WOULDBLOCK || get_last_socket_error() == EAGAIN
                                                 continue;
 
-                                            log_error("Error: recv returned -1 with error %\n", get_last_socket_error());
+                                            log_error("Error: ws_read returned -1 with error %\n", get_last_socket_error());
                                             continue;
                                         } else if in_count == 0 {
                                             should_continue = true;
@@ -603,6 +689,9 @@ END;
                                         mask := frame[1] & (0b10000000);
 
                                         if !mask {
+                                            if config.on_disconnect_callback
+                                                config.on_disconnect_callback(server, client);
+
                                             log("Client % tried to send unmasked frame, disconnecting.", client - clients.data);
                                             epoll_ctl(epoll_fd, EPOLL_CTL_DEL, client.socket_fd, null);
                                             close(client.socket_fd);
@@ -613,6 +702,9 @@ END;
                                         client.frame_header = parse_frame_header(frame);
 
                                         if client.frame_header.opcode == .Close {
+                                            if config.on_disconnect_callback
+                                                config.on_disconnect_callback(server, client);
+
                                             log("Client % disconnecting.", client - clients.data);
                                             epoll_ctl(epoll_fd, EPOLL_CTL_DEL, client.socket_fd, null);
                                             close(client.socket_fd);
@@ -627,10 +719,7 @@ END;
                                         reset(*client.input_buffer);
                                         client.state = .ReadPayload;
 
-                                        epoll_ctl(epoll_fd, EPOLL_CTL_MOD, client.socket_fd, *epoll_event.{
-                                            events = xx EPOLLIN | xx EPOLLET,
-                                            data = .{ ptr = client }
-                                        });
+                                        should_continue = true;
                                     }
                                 }
 
@@ -639,17 +728,16 @@ END;
 
                                 while true {
                                     buffer: [client.input_buffer.Block_Length]u8;
-                                    in_count := recv(
-                                        client.socket_fd,
-                                        buffer.data,
-                                        min(cast(u64) buffer.count, client.frame_header.payload_length - xx already_read),
-                                        0);
+                                    in_count := ws_read(
+                                        client,
+                                        buffer,
+                                        min(cast(int) buffer.count, cast(int) (client.frame_header.payload_length - already_read)));
 
                                     if in_count == -1 {
                                         if get_last_socket_error() == SOCKET_WOULDBLOCK || get_last_socket_error() == EAGAIN
                                             break;
 
-                                        log_error("Error: recv returned -1 with error %\n", get_last_socket_error());
+                                        log_error("Error: ws_read returned -1 with error %\n", get_last_socket_error());
                                         break;
                                     } else if in_count == 0 {
                                         // hard disconnect
@@ -689,13 +777,15 @@ END;
                                                 current_offset += it.count;
                                             }
 
-                                            on_message_callback(server, client, whole_message);
+                                            if config.on_message_callback
+                                                config.on_message_callback(server, client, whole_message);
 
                                             for client.continuation_payload
                                                 array_free(it);
 
                                             array_reset(*client.continuation_payload);
-                                        } else on_message_callback(server, client, decoded_payload);
+                                        } else if config.on_message_callback
+                                            config.on_message_callback(server, client, decoded_payload);
                                     }
 
                                     client.state = .ExpectAndReadFrameHeader;
