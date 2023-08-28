@@ -1,7 +1,7 @@
 #import "Basic";
 #import "String";
 #import "Socket";
-#import "Base64_Encode";
+#import "Base64";
 #import "Bit_Operations";
 #import "OpenSSL";
 #import "Flat_Pool";
